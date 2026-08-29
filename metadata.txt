@@ -1,0 +1,11 @@
+[general]
+name=GIS Data Inspector
+qgisMinimumVersion=4.0
+description=Universal GIS statistics and QA/QC dashboard for polygon, line and point vector layers.
+version=1.5.3
+author=GIS Telugu
+about=Inspect vector layers for geometry statistics, attribute quality, unique values, duplicates, suspicious text, and geometry issues.
+category=Vector
+experimental=False
+deprecated=False
+tags=GIS,QA,QC,statistics,geometry,attributes,quality,inspection,polygon,line,point
