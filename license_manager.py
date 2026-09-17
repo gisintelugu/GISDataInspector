@@ -3,8 +3,6 @@ import hashlib
 import json
 import os
 import platform
-import re
-import subprocess
 import uuid
 from datetime import datetime, timezone
 
@@ -13,8 +11,7 @@ from qgis.PyQt.QtWidgets import QInputDialog, QMessageBox
 
 PRODUCT = "GISDataInspector"
 TRIAL_HOURS = 24
-# Public RSA key only. The private signing key is never shipped with the plugin.
-RSA_N = 22547485548353752942725971494942334511080071135664926281375140654058768841846279060272427004685155569995868575412638134775593743879891978919011539587585655670294343100865696848050369601569271210583451734777504178220012329761472700198941206498668888452097233558990016252181069681541851014715294694867278371359608669159390818429078747264065316224808780699375289401002636418594270113936013974555051183582055084406901063863598562923634115280260557600038771839024267825397177402632948551730008822683796277089625874033818139391209942771960598423961976697578396542994494322744027447861401215814511394283848544247
+RSA_N = 21514663369000084018316754234422623902455242756814971820422956510757648574522056230174968711601025343143944951687107116995911873456193505096380850501103862845965864219927879723596716028992681724764068281004978794621478589600501295265221391078021374826561263454876414871885207162297048508768064762705073330321976256771664357667802408939180851842928467325152353547284653112047095506338104517937815319442544010234283561168084742585042186878317451318730943309908148856573838713036211141416751497035409537267911414131244115659253556230888547812442822800803676376372084099446917090381894342758454026528651998617492970014471
 RSA_E = 65537
 
 
@@ -51,15 +48,14 @@ def machine_id():
                 parts.append(str(winreg.QueryValueEx(key, "MachineGuid")[0]))
         except Exception:
             pass
-    raw = "|".join(parts).encode("utf-8", "ignore")
-    return hashlib.sha256(raw).hexdigest().upper()
+    return hashlib.sha256("|".join(parts).encode("utf-8", "ignore")).hexdigest().upper()
 
 
 def _state_path():
     base = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
     if not base:
         base = os.path.expanduser("~")
-    folder = os.path.join(base, "GISDataInspector")
+    folder = os.path.join(base, PRODUCT)
     os.makedirs(folder, exist_ok=True)
     return os.path.join(folder, ".trial_state.json")
 
@@ -82,9 +78,8 @@ def _write_state(state):
 
 
 def _rsa_verify(message, signature):
-    # PKCS#1 v1.5 SHA-256 verification, implemented without external packages.
-    digest_info_prefix = bytes.fromhex("3031300d060960864801650304020105000420")
-    expected = digest_info_prefix + hashlib.sha256(message).digest()
+    # PKCS#1 v1.5 SHA-256 verification without external crypto packages.
+    digest_info = bytes.fromhex("3031300d060960864801650304020105000420") + hashlib.sha256(message).digest()
     k = (RSA_N.bit_length() + 7) // 8
     if len(signature) != k:
         return False
@@ -92,11 +87,10 @@ def _rsa_verify(message, signature):
     if s >= RSA_N:
         return False
     em = pow(s, RSA_E, RSA_N).to_bytes(k, "big")
-    prefix = b"\\x00\\x01"
-    sep = em.find(b"\\x00", 2)
-    if not em.startswith(prefix) or sep < 10:
+    sep = em.find(b"\x00", 2)
+    if not em.startswith(b"\x00\x01") or sep < 10:
         return False
-    return em[sep + 1:] == expected
+    return em[sep + 1:] == digest_info
 
 
 class LicenseManager:
@@ -106,12 +100,11 @@ class LicenseManager:
         self.mid = machine_id()
 
     def status(self):
-        # Returns (allowed, mode, message).
-        license_key = self.settings.value("license/key", "", type=str).strip()
-        if license_key:
-            ok, message = self._validate_license(license_key)
+        key = self.settings.value("license/key", "", type=str).strip()
+        if key:
+            ok, msg = self._validate_license(key)
             if ok:
-                return True, "licensed", message
+                return True, "licensed", msg
 
         now = _utc_now()
         state = _read_state()
@@ -120,8 +113,7 @@ class LicenseManager:
 
         if not first_text:
             first_text = _iso(now)
-            state["first_run"] = first_text
-            state["last_seen"] = first_text
+            state = {"first_run": first_text, "last_seen": first_text}
             _write_state(state)
             self.settings.setValue("trial/first_run", first_text)
             self.settings.setValue("trial/last_seen", first_text)
@@ -130,11 +122,10 @@ class LicenseManager:
 
         try:
             first = _parse_iso(first_text)
-            last = _parse_iso(last_text) if last_text else first
+            last = _parse_iso(last_text or first_text)
         except Exception:
             return False, "expired", "Trial state is invalid."
 
-        # Detect meaningful system clock rollback.
         if now.timestamp() < last.timestamp() - 300:
             return False, "clock", "System clock rollback detected."
 
@@ -144,13 +135,11 @@ class LicenseManager:
             self.settings.setValue("trial/last_seen", state["last_seen"])
             self.settings.sync()
 
-        elapsed = (now - first).total_seconds()
-        remaining = max(0, int(TRIAL_HOURS * 3600 - elapsed))
+        remaining = int(TRIAL_HOURS * 3600 - (now - first).total_seconds())
         if remaining > 0:
-            hours = remaining // 3600
-            minutes = (remaining % 3600) // 60
-            return True, "trial", f"Trial active — approximately {hours}h {minutes}m remaining."
-
+            h, rem = divmod(remaining, 3600)
+            m = rem // 60
+            return True, "trial", f"Trial active — approximately {h}h {m}m remaining."
         return False, "expired", "The 24-hour trial has expired."
 
     def _validate_license(self, key):
@@ -165,30 +154,26 @@ class LicenseManager:
             payload = json.loads(payload_bytes.decode("utf-8"))
             if payload.get("product") != PRODUCT:
                 return False, "License is for another product."
-            if payload.get("machine_id", "").upper() != self.mid:
+            if str(payload.get("machine_id", "")).upper() != self.mid:
                 return False, "License is not valid for this computer."
             expires = payload.get("expires_at")
-            if expires:
-                if _utc_now() > _parse_iso(expires):
-                    return False, "License has expired."
+            if expires and _utc_now() > _parse_iso(expires):
+                return False, "License has expired."
             return True, "License activated successfully."
         except Exception as exc:
             return False, f"License validation failed: {exc}"
 
+    def require_access(self):
+        allowed, _mode, _message = self.status()
+        return allowed or self.show_license_dialog()
+
     def show_license_dialog(self):
         allowed, mode, message = self.status()
         if allowed:
-            if mode == "trial":
-                QMessageBox.information(self.parent, "GIS Data Inspector — Trial", message)
-            else:
-                QMessageBox.information(self.parent, "GIS Data Inspector — License", message)
+            QMessageBox.information(self.parent, "GIS Data Inspector", message)
             return True
-
-        prompt = (
-            "Your 24-hour trial has expired.\n\n"
-            "Machine ID:\n" + self.mid +
-            "\n\nPaste your license key below."
-        )
+        prompt = ("Your 24-hour trial has expired.\n\nMachine ID:\n" + self.mid +
+                  "\n\nPaste your license key below:")
         key, ok = QInputDialog.getText(self.parent, "GIS Data Inspector — License", prompt)
         if not ok or not key.strip():
             return False
@@ -200,12 +185,3 @@ class LicenseManager:
         self.settings.sync()
         QMessageBox.information(self.parent, "GIS Data Inspector — License", validation_message)
         return True
-
-    def require_access(self):
-        allowed, mode, message = self.status()
-        if allowed:
-            return True
-        return self.show_license_dialog()
-
-    def machine_id_text(self):
-        return self.mid
